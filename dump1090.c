@@ -35,6 +35,11 @@
 #include <stdint.h>
 #include <errno.h>
 #include <unistd.h>
+
+#ifndef __USE_MISC
+#define __USE_MISC
+#endif
+
 #include <math.h>
 #include <sys/time.h>
 #include <signal.h>
@@ -43,7 +48,15 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
-#include "rtl-sdr.h"
+
+#ifdef RTL_SDR
+#include <rtl-sdr.h>
+#endif
+
+#ifdef LMS_SDR
+#include <lime/LimeSuite.h>
+#endif
+
 #include "anet.h"
 
 #define MODES_DEFAULT_RATE         2000000
@@ -53,7 +66,7 @@
 #define MODES_ASYNC_BUF_NUMBER     12
 #define MODES_DATA_LEN             (16*16384)   /* 256k */
 #define MODES_AUTO_GAIN            -100         /* Use automatic gain. */
-#define MODES_MAX_GAIN             999999       /* Use max available gain. */
+#define MODES_MAX_GAIN             73           /* Use max available gain. */
 
 #define MODES_PREAMBLE_US 8       /* microseconds */
 #define MODES_LONG_MSG_BITS 112
@@ -137,12 +150,24 @@ struct {
     uint16_t *maglut;               /* I/Q -> Magnitude lookup table. */
     int exit;                       /* Exit from the main loop when true. */
 
-    /* RTLSDR */
-    int dev_index;
-    int gain;
-    int enable_agc;
-    rtlsdr_dev_t *dev;
     int freq;
+    int gain;
+
+    /* RTL SDR */
+    #ifdef RTL_SDR
+    int dev_index;
+    int enable_agc;
+    rtl_dev_t* dev;
+    #endif
+
+    /* LIMESDR */
+    #ifdef LMS_SDR
+    int n_rx;
+    lms_device_t* dev;
+    lms_stream_t stream;
+    void* recv_buff;
+    #endif
+
 
     /* Networking */
     char aneterr[ANET_ERR_LEN];
@@ -259,8 +284,6 @@ static long long mstime(void) {
 
 void modesInitConfig(void) {
     Modes.gain = MODES_MAX_GAIN;
-    Modes.dev_index = 0;
-    Modes.enable_agc = 0;
     Modes.freq = MODES_DEFAULT_FREQ;
     Modes.filename = NULL;
     Modes.fix_errors = 1;
@@ -276,7 +299,20 @@ void modesInitConfig(void) {
     Modes.aggressive = 0;
     Modes.interactive_rows = getTermRows();
     Modes.loop = 0;
+#ifdef RTL_SDR
+    Modes.dev_index = 0;
+    Modes.enable_agc = 0;
+#endif
+#ifdef LMS_SDR
+    Modes.n_rx = 0;
+#endif
 }
+
+#ifdef LMS_SDR
+void lmsErrorHandler(int lvl, const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+}
+#endif
 
 void modesInit(void) {
     int i, q;
@@ -302,6 +338,12 @@ void modesInit(void) {
         exit(1);
     }
     memset(Modes.data,127,Modes.data_len);
+
+#ifdef LMS_SDR
+    Modes.recv_buff = malloc(MODES_DATA_LEN * MODES_ASYNC_BUF_NUMBER);
+    Modes.stream.dataFmt = LMS_FMT_I16;
+    LMS_RegisterLogHandler(lmsErrorHandler);
+#endif
 
     /* Populate the I/Q -> Magnitude lookup table. It is used because
      * sqrt or round may be expensive and may vary a lot depending on
@@ -333,6 +375,7 @@ void modesInit(void) {
 
 /* =============================== RTLSDR handling ========================== */
 
+#ifdef RTL_SDR
 void modesInitRTLSDR(void) {
     int j;
     int device_count;
@@ -384,7 +427,43 @@ void modesInitRTLSDR(void) {
     fprintf(stderr, "Gain reported by device: %.2f\n",
         rtlsdr_get_tuner_gain(Modes.dev)/10.0);
 }
+#endif
 
+#if LMS_SDR
+void modesInitLimeSDR(void) {
+    int device_count = -1;
+    lms_info_str_t devs[10];
+
+    if(-1 == (device_count = LMS_GetDeviceList(&devs))) {
+        fprintf(stderr, "Failed to get LMS devices.\n");
+        exit(1);
+    }
+
+    fprintf(stderr, "Found %d device(s):\n", device_count);
+    for(unsigned int j = 0; j < device_count; j++) {
+        fprintf(stderr, "%s\n", devs[j]);
+    }
+
+    if(0 != LMS_Open(&Modes.dev, devs[0], NULL)) {
+        exit(1);
+    }
+
+    Modes.n_rx= LMS_GetNumChannels(Modes.dev, Modes.stream.isTx);
+    if(Modes.n_rx < 1) {
+        exit(1);
+    }
+
+    if(0 != LMS_EnableChannel(Modes.dev, Modes.stream.isTx, Modes.stream.channel, true)) {
+        exit(1);
+    }
+
+    if(0 != LMS_Init(Modes.dev)) {
+        exit(1);
+    }
+}
+#endif
+
+#ifdef RTL_SDR
 /* We use a thread reading data in background, while the main thread
  * handles decoding and visualization of data to the user.
  *
@@ -406,6 +485,7 @@ void rtlsdrCallback(unsigned char *buf, uint32_t len, void *ctx) {
     pthread_cond_signal(&Modes.data_cond);
     pthread_mutex_unlock(&Modes.data_mutex);
 }
+#endif
 
 /* This is used when --ifile is specified in order to read data from file
  * instead of using an RTLSDR device. */
@@ -463,6 +543,7 @@ void readDataFromFile(void) {
     }
 }
 
+#ifdef RTL_SDR
 /* We read data using a thread, so the main thread only handles decoding
  * without caring about data acquisition. */
 void *readerThreadEntryPoint(void *arg) {
@@ -472,6 +553,89 @@ void *readerThreadEntryPoint(void *arg) {
         rtlsdr_read_async(Modes.dev, rtlsdrCallback, NULL,
                               MODES_ASYNC_BUF_NUMBER,
                               MODES_DATA_LEN);
+    } else {
+        readDataFromFile();
+    }
+    return NULL;
+}
+#endif
+
+void *readerThreadEntryPoint(void *arg) {
+    MODES_NOTUSED(arg);
+
+    if (Modes.filename == NULL) {
+        if(0 != LMS_SetAntenna(Modes.dev, Modes.stream.isTx, Modes.stream.channel, LMS_PATH_LNAL)) {
+            exit(1);
+        }
+
+        if(0 != LMS_SetSampleRate(Modes.dev, MODES_DEFAULT_RATE, Modes.stream.channel)){ 
+            exit(1);
+        }
+
+        if(0 != LMS_SetLOFrequency(Modes.dev, Modes.stream.isTx, Modes.stream.channel, Modes.freq)) {
+            exit(1);
+        }
+
+        double cf;
+        if(0 != LMS_GetLOFrequency(Modes.dev, Modes.stream.isTx, Modes.stream.channel, &cf)) {
+            exit(1);
+        } else {
+            fprintf(stderr, "Using center freq: %f MHz\n", cf * 1e-6);
+        }
+
+        if(0 != LMS_SetGaindB(Modes.dev, Modes.stream.isTx, Modes.stream.channel, Modes.gain)) {
+            exit(1);
+        }
+
+        if(0 != LMS_SetLPFBW(Modes.dev, Modes.stream.isTx, Modes.stream.channel, MODES_DEFAULT_RATE)) {
+            exit(1);
+        }
+
+        if(0 != LMS_SetupStream(Modes.dev, &Modes.stream)) {
+            exit(1);
+        }
+
+        if(0 != LMS_Calibrate(Modes.dev, Modes.stream.isTx, Modes.stream.channel, MODES_DEFAULT_RATE, 0)) {
+            exit(1);
+        }
+
+        if(0 != LMS_StartStream(&Modes.stream)) {
+            exit(1);
+        }
+    
+        while(!Modes.exit) {
+            pthread_mutex_lock(&Modes.data_mutex);
+
+            if (Modes.data_ready) {
+                pthread_cond_wait(&Modes.data_cond,&Modes.data_mutex);
+                pthread_mutex_unlock(&Modes.data_mutex);
+                continue;
+            }
+
+            int len = LMS_RecvStream(&Modes.stream, Modes.recv_buff, MODES_DATA_LEN / 4, 0, 100);
+            if(len != 0) {
+
+                //downsample to u8
+                for(unsigned int sx = 0; sx < len * 2 /* I+Q */; sx++) {
+                    int16_t s16 = ((int16_t*)Modes.recv_buff)[sx];
+
+                    ((uint8_t*)Modes.recv_buff)[sx] = 127 + (s16 / 256);
+                }
+
+                len *= 2;
+
+                if (len > MODES_DATA_LEN) len = MODES_DATA_LEN;
+                /* Move the last part of the previous buffer, that was not processed,
+                * on the start of the new buffer. */
+                memcpy(Modes.data, Modes.data+MODES_DATA_LEN, (MODES_FULL_LEN-1)*4);
+                /* Read the new data. */
+                memcpy(Modes.data+(MODES_FULL_LEN-1)*4, Modes.recv_buff, len);
+                Modes.data_ready = 1;
+                /* Signal to the other thread that new data is ready */
+                pthread_cond_signal(&Modes.data_cond);
+            }
+            pthread_mutex_unlock(&Modes.data_mutex);
+        }
     } else {
         readDataFromFile();
     }
@@ -2506,11 +2670,11 @@ int main(int argc, char **argv) {
         int more = j+1 < argc; /* There are more arguments. */
 
         if (!strcmp(argv[j],"--device-index") && more) {
-            Modes.dev_index = atoi(argv[++j]);
+            //Modes.dev_index = atoi(argv[++j]);
         } else if (!strcmp(argv[j],"--gain") && more) {
-            Modes.gain = atof(argv[++j])*10; /* Gain is in tens of DBs */
+            Modes.gain = atof(argv[++j]);
         } else if (!strcmp(argv[j],"--enable-agc")) {
-            Modes.enable_agc++;
+            //Modes.enable_agc++;
         } else if (!strcmp(argv[j],"--freq") && more) {
             Modes.freq = strtoll(argv[++j],NULL,10);
         } else if (!strcmp(argv[j],"--ifile") && more) {
@@ -2591,7 +2755,12 @@ int main(int argc, char **argv) {
     if (Modes.net_only) {
         fprintf(stderr,"Net-only mode, no RTL device or file open.\n");
     } else if (Modes.filename == NULL) {
+#ifdef RTL_SDR
         modesInitRTLSDR();
+#endif
+#ifdef LMS_SDR
+        modesInitLimeSDR();
+#endif
     } else {
         if (Modes.filename[0] == '-' && Modes.filename[1] == '\0') {
             Modes.fd = STDIN_FILENO;
@@ -2652,7 +2821,9 @@ int main(int argc, char **argv) {
             Modes.stat_goodcrc + Modes.stat_fixed);
     }
 
+#ifdef RTL_SDR
     rtlsdr_close(Modes.dev);
+#endif
     return 0;
 }
 
