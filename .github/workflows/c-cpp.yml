@@ -1,0 +1,21 @@
+name: Ubuntu x86_64
+
+on:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v2
+    - name: apt
+      run: apt update && apt install liblimesuite-dev
+    - name: make
+      run: make
+    - name: artifact
+      uses: actions/upload-artifact@v2.1.4
+      with:
+        name: release_binary
+        path: dump1090
