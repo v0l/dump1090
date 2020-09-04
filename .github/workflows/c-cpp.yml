@@ -11,7 +11,7 @@ jobs:
     steps:
     - uses: actions/checkout@v2
     - name: apt
-      run: apt update && apt install liblimesuite-dev
+      run: sudo apt update && sudo apt install -y liblimesuite-dev
     - name: make
       run: make
     - name: artifact
